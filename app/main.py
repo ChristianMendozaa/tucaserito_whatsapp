@@ -109,8 +109,9 @@ async def process_bot_message(phone_number: str, message_text: str, message_id: 
         # We search the core.product table for this specific merchant
         # using <=> (cosine distance) for the top 5 closest items.
         query = """
-            SELECT p.name, p.description, p.price, p.sku
+            SELECT p.name, p.description, pp.price, p.sku
             FROM core.product p
+            LEFT JOIN core.product_price pp ON pp.product_id = p.id
             WHERE p.merchant_id = $1::uuid
               AND p.embedding IS NOT NULL
               AND p.is_active = true
