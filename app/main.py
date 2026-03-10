@@ -146,36 +146,73 @@ async def process_bot_message(phone_number: str, message_text: str, message_id: 
         {kb_text}
         """
 
-        # 4. Fetch conversation history from Postgres
+        # 4. Handle Conversation History & Saving to DB
+        conn = await asyncpg.connect(_clean_db_url(DATABASE_URL))
+
+        # Ensure a thread exists for this phone number
+        thread_query = """
+            INSERT INTO comm.thread (merchant_id, type, channel, external_address, status)
+            VALUES ($1::uuid, 'customer', 'whatsapp', $2, 'open')
+            ON CONFLICT DO NOTHING;
+            
+            SELECT id FROM comm.thread 
+            WHERE merchant_id = $1::uuid AND external_address = $2
+            LIMIT 1;
+        """
+        # asyncpg execute doesn't return the select if chained, so we do it in two steps
+        await conn.execute("""
+            INSERT INTO comm.thread (merchant_id, type, channel, external_address, status)
+            SELECT $1::uuid, 'customer', 'whatsapp', $2, 'open'
+            WHERE NOT EXISTS (
+                SELECT 1 FROM comm.thread 
+                WHERE merchant_id = $1::uuid AND external_address = $2
+            )
+        """, MERCHANT_ID, phone_number)
+        
+        thread_row = await conn.fetchrow("""
+            SELECT id FROM comm.thread 
+            WHERE merchant_id = $1::uuid AND external_address = $2
+            LIMIT 1
+        """, MERCHANT_ID, phone_number)
+        thread_id = thread_row['id'] if thread_row else None
+
+        # Save incoming user message
+        if thread_id:
+            import uuid
+            idempotency = message_id or str(uuid.uuid4())
+            await conn.execute("""
+                INSERT INTO comm.thread_message (
+                    thread_id, direction, sender_type, message_type, body, status, provider_message_id, idempotency_key
+                ) VALUES ($1, 'in', 'customer', 'text', $2, 'delivered', $3, $4)
+                ON CONFLICT ON CONSTRAINT uq_msg_thread_idem DO NOTHING
+            """, thread_id, message_text, message_id, idempotency)
+
+        # Fetch recent history
         history_query = """
-            SELECT m.direction, m.body
-            FROM comm.thread_message m
-            JOIN comm.thread t ON m.thread_id = t.id
-            WHERE t.external_address = $1
-              AND t.merchant_id = $2::uuid
-            ORDER BY m.created_at DESC
+            SELECT direction, body
+            FROM comm.thread_message
+            WHERE thread_id = $1
+            ORDER BY created_at DESC
             LIMIT 10
         """
-        conn = await asyncpg.connect(_clean_db_url(DATABASE_URL))
-        history_rows = await conn.fetch(history_query, phone_number, MERCHANT_ID)
-        await conn.close()
+        history_rows = await conn.fetch(history_query, thread_id) if thread_id else []
 
         # Build prompt messages
-        messages = [
-            {"role": "system", "content": system_prompt}
-        ]
+        messages = [{"role": "system", "content": system_prompt}]
         
         # history_rows are DESC (newest first). We need to append them chronologically.
         for row in reversed(history_rows):
             role_map = {"in": "user", "out": "assistant"}
             role = role_map.get(row['direction'], "user")
             body = row['body'] or ""
-            # Don't add completely empty messages
-            if body.strip():
+            if body.strip() and row['direction'] != 'in' or row['body'] != message_text:
+                # We skip the current message text if it's the newest 'in' in history to avoid duplication,
+                # but since we already inserted it above, it IS in the history.
                 messages.append({"role": role, "content": body})
-                
-        # Append the new current message
-        messages.append({"role": "user", "content": message_text})
+        
+        # In case the insert above wasn't fetched or something, we ensure the current message is at the end.
+        if messages[-1]['content'] != message_text:
+             messages.append({"role": "user", "content": message_text})
 
         # 5. Ask OpenAI to draft the reply as a salesperson
         chat_resp = await openai_client.chat.completions.create(
@@ -183,6 +220,19 @@ async def process_bot_message(phone_number: str, message_text: str, message_id: 
             messages=messages,
             temperature=0.3
         )
+        
+        reply_text = chat_resp.choices[0].message.content
+
+        # Save outgoing bot message
+        if thread_id:
+            import uuid
+            await conn.execute("""
+                INSERT INTO comm.thread_message (
+                    id, thread_id, direction, sender_type, message_type, body, status, idempotency_key
+                ) VALUES ($1, $2, 'out', 'bot', 'text', $3, 'queued', $4)
+            """, uuid.uuid4(), thread_id, reply_text, str(uuid.uuid4()))
+            
+        await conn.close()
         
         reply_text = chat_resp.choices[0].message.content
 
