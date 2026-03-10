@@ -131,10 +131,8 @@ async def process_bot_message(phone_number: str, message_text: str, message_id: 
             context_parts.append(f"- {r['name']} (SKU: {r['sku']}) | Precio: ${price} | Specs: {desc}")
             
         kb_text = "\n".join(context_parts) if context_parts else "No se encontraron productos relacionados."
-
         logger.info(f"Semantic Search Context:\n{kb_text}")
 
-        # 4. Ask OpenAI to draft the reply as a salesperson
         system_prompt = f"""
         Eres el amigable asistente virtual de ventas de Tu Caserito. 
         Tu tarea es responder preguntas de clientes en WhatsApp sobre nuestros productos.
@@ -148,12 +146,41 @@ async def process_bot_message(phone_number: str, message_text: str, message_id: 
         {kb_text}
         """
 
+        # 4. Fetch conversation history from Postgres
+        history_query = """
+            SELECT m.direction, m.body
+            FROM comm.thread_message m
+            JOIN comm.thread t ON m.thread_id = t.id
+            WHERE t.external_address = $1
+              AND t.merchant_id = $2::uuid
+            ORDER BY m.created_at DESC
+            LIMIT 10
+        """
+        conn = await asyncpg.connect(_clean_db_url(DATABASE_URL))
+        history_rows = await conn.fetch(history_query, phone_number, MERCHANT_ID)
+        await conn.close()
+
+        # Build prompt messages
+        messages = [
+            {"role": "system", "content": system_prompt}
+        ]
+        
+        # history_rows are DESC (newest first). We need to append them chronologically.
+        for row in reversed(history_rows):
+            role_map = {"in": "user", "out": "assistant"}
+            role = role_map.get(row['direction'], "user")
+            body = row['body'] or ""
+            # Don't add completely empty messages
+            if body.strip():
+                messages.append({"role": role, "content": body})
+                
+        # Append the new current message
+        messages.append({"role": "user", "content": message_text})
+
+        # 5. Ask OpenAI to draft the reply as a salesperson
         chat_resp = await openai_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": message_text}
-            ],
+            messages=messages,
             temperature=0.3
         )
         
