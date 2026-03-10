@@ -149,25 +149,32 @@ async def process_bot_message(phone_number: str, message_text: str, message_id: 
         # 4. Handle Conversation History & Saving to DB
         conn = await asyncpg.connect(_clean_db_url(DATABASE_URL))
 
+        # Get or create customer
+        customer_row = await conn.fetchrow("""
+            SELECT id FROM ops.customer 
+            WHERE merchant_id = $1::uuid AND (whatsapp = $2 OR phone = $2)
+            LIMIT 1
+        """, MERCHANT_ID, phone_number)
+        
+        if customer_row:
+            customer_id = customer_row['id']
+        else:
+            import uuid
+            customer_id = uuid.uuid4()
+            await conn.execute("""
+                INSERT INTO ops.customer (id, merchant_id, name, whatsapp)
+                VALUES ($1, $2::uuid, $3, $4)
+            """, customer_id, MERCHANT_ID, f"WA {phone_number}", phone_number)
+
         # Ensure a thread exists for this phone number
-        thread_query = """
-            INSERT INTO comm.thread (merchant_id, type, channel, external_address, status)
-            VALUES ($1::uuid, 'customer', 'whatsapp', $2, 'open')
-            ON CONFLICT DO NOTHING;
-            
-            SELECT id FROM comm.thread 
-            WHERE merchant_id = $1::uuid AND external_address = $2
-            LIMIT 1;
-        """
-        # asyncpg execute doesn't return the select if chained, so we do it in two steps
         await conn.execute("""
-            INSERT INTO comm.thread (merchant_id, type, channel, external_address, status)
-            SELECT $1::uuid, 'customer', 'whatsapp', $2, 'open'
+            INSERT INTO comm.thread (merchant_id, type, channel, external_address, status, customer_id)
+            SELECT $1::uuid, 'customer', 'whatsapp', $2, 'open', $3
             WHERE NOT EXISTS (
                 SELECT 1 FROM comm.thread 
                 WHERE merchant_id = $1::uuid AND external_address = $2
             )
-        """, MERCHANT_ID, phone_number)
+        """, MERCHANT_ID, phone_number, customer_id)
         
         thread_row = await conn.fetchrow("""
             SELECT id FROM comm.thread 
@@ -182,10 +189,10 @@ async def process_bot_message(phone_number: str, message_text: str, message_id: 
             idempotency = message_id or str(uuid.uuid4())
             await conn.execute("""
                 INSERT INTO comm.thread_message (
-                    thread_id, direction, sender_type, message_type, body, status, provider_message_id, idempotency_key
-                ) VALUES ($1, 'in', 'customer', 'text', $2, 'delivered', $3, $4)
+                    thread_id, direction, sender_type, sender_customer_id, message_type, body, status, provider_message_id, idempotency_key
+                ) VALUES ($1, 'in', 'customer', $2, 'text', $3, 'delivered', $4, $5)
                 ON CONFLICT ON CONSTRAINT uq_msg_thread_idem DO NOTHING
-            """, thread_id, message_text, message_id, idempotency)
+            """, thread_id, customer_id, message_text, message_id, idempotency)
 
         # Fetch recent history
         history_query = """
